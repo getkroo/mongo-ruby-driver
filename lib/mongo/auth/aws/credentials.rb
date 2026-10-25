@@ -31,6 +31,19 @@ module Mongo
             Time.now.utc >= expiration - 300
           end
         end
+
+        # Whether the credentials can still sign a handshake, even if due for refresh.
+        #
+        # @return [ true | false ]
+        def usable?
+          expiration.nil? || Time.now.utc < expiration - 30
+        end
+
+        # Keeps the secret and session token out of logs and error output.
+        def inspect
+          "#<#{self.class.name} access_key_id=#{access_key_id.inspect} expiration=#{expiration.inspect}>"
+        end
+        alias_method :to_s, :inspect
       end
     end
   end

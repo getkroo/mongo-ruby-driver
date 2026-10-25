@@ -35,7 +35,7 @@ describe Mongo::Auth::Aws::CredentialsCache do
 
     context 'when credentials are expired' do
       let(:credentials) do
-        double('credentials', expired?: true)
+        double('credentials', expired?: true, usable?: false)
       end
 
       it 'yields to the block' do
