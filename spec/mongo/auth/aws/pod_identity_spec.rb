@@ -173,6 +173,7 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
         agent.hold = Queue.new
 
         refreshing = Thread.new { retriever.credentials }
+        refreshing.report_on_exception = false
         agent.requests.pop
         cache.clear
         agent.hold << :respond
