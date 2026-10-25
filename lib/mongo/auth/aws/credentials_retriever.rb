@@ -321,6 +321,8 @@ module Mongo
 
         def credentials_from_container_payload(body)
           payload = JSON.parse(body)
+          return nil unless payload.is_a?(Hash)
+
           Credentials.new(
             payload['AccessKeyId'],
             payload['SecretAccessKey'],

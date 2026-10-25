@@ -23,6 +23,7 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
     ensure
       saved.each { |k, v| v.nil? ? ENV.delete(k) : ENV[k] = v }
       agent.stop
+      token_file.close!
     end
 
     it 'fetches credentials from the agent with the rotating token from the token file' do
@@ -132,11 +133,30 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
       end
 
       it 'keeps still-usable credentials when the agent returns a malformed payload' do
-        cache.credentials = Mongo::Auth::Aws::Credentials.new('ASIAOLD', 'old', 'old-token', Time.now.utc + 240)
-        agent.credentials = { 'AccessKeyId' => 'ASIANEW', 'SecretAccessKey' => 'new', 'Token' => 'new-token',
-                              'Expiration' => 'not a time' }
+        bodies = [
+          'null',
+          '[]',
+          '{"AccessKeyId":"ASIANEW"}',
+          '{"AccessKeyId":"ASIANEW","SecretAccessKey":"new","Token":"new-token","Expiration":"not a time"}',
+          %({"AccessKeyId":"ASIANEW","Token":"new-token","Expiration":"#{(Time.now.utc + 3600).iso8601}"}),
+        ]
+        bodies.each do |body|
+          cache = Mongo::Auth::Aws::CredentialsCache.new
+          cache.credentials = Mongo::Auth::Aws::Credentials.new('ASIAOLD', 'old', 'old-token', Time.now.utc + 240)
+          agent.raw_body = body
 
-        expect(retriever.credentials.access_key_id).to eq('ASIAOLD')
+          expect(described_class.new(nil, credentials_cache: cache).credentials.access_key_id).to eq('ASIAOLD'), body
+        end
+        expect(agent.request_count).to eq(bodies.size)
+      end
+
+      it 'stops retrying a failing agent for a moment while serving usable credentials' do
+        cache.credentials = Mongo::Auth::Aws::Credentials.new('ASIAOLD', 'old', 'old-token', Time.now.utc + 240)
+        agent.status = 500
+
+        2.times { expect(retriever.credentials.access_key_id).to eq('ASIAOLD') }
+
+        expect(agent.request_count).to eq(1)
       end
 
       it 'does not sign with credentials that crossed the expiry margin during a failed refresh' do
@@ -150,11 +170,12 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
       it 'does not resurrect credentials the server rejected while a refresh was failing' do
         cache.credentials = Mongo::Auth::Aws::Credentials.new('ASIAOLD', 'old', 'old-token', Time.now.utc + 240)
         agent.status = 500
-        agent.delay = 0.5
+        agent.hold = Queue.new
 
         refreshing = Thread.new { retriever.credentials }
-        sleep 0.1
+        agent.requests.pop
         cache.clear
+        agent.hold << :respond
 
         expect { refreshing.value }.to raise_error(Mongo::Auth::Aws::CredentialsNotFound)
       end

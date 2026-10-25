@@ -78,11 +78,8 @@ module Mongo
             @refresh_lock.synchronize do
               current = credentials
               next current if current && !current.expired?
-              next nil if @failed_at && Utils.monotonic_time - @failed_at < FAILURE_BACKOFF_SECONDS
 
-              fetched = yield
-              @failed_at = fetched.nil? ? Utils.monotonic_time : nil
-              self.credentials = fetched
+              self.credentials = attempt(&block)
             end
           end
         end
@@ -96,12 +93,27 @@ module Mongo
 
         private
 
+        # Runs under @refresh_lock. Callers arriving within the backoff after a failure skip the endpoint.
+        def attempt
+          return nil if @failed_at && Utils.monotonic_time - @failed_at < FAILURE_BACKOFF_SECONDS
+
+          fetched = yield
+          @failed_at = fetched.nil? ? Utils.monotonic_time : nil
+          fetched
+        end
+
         # Re-reads the cache rather than a snapshot so a concurrent refresh or clear is honored.
-        def refresh_keeping_cached
+        def refresh_keeping_cached(&block)
           current = credentials
           return current if current && !current.expired?
 
-          refreshed = yield
+          refreshed = begin
+            attempt(&block)
+          rescue Auth::InvalidConfiguration
+            # A malformed agent response is a failed refresh here; it resurfaces once the cached set is unusable.
+            @failed_at = Utils.monotonic_time
+            nil
+          end
           if refreshed.nil?
             current = credentials
             return current&.usable? ? current : nil

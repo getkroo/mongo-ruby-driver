@@ -10,11 +10,13 @@ class FakePodIdentityAgent
   Request = Struct.new(:path, :authorization)
 
   attr_reader :requests
-  attr_accessor :delay, :status, :credentials
+  # hold: when set to a Queue, each handler waits for a pop after recording its request.
+  attr_accessor :delay, :status, :credentials, :raw_body, :hold
 
   def initialize(credentials: nil, ttl: 3600)
     @server = TCPServer.new('127.0.0.1', 0)
     @requests = Queue.new
+    @workers = []
     @delay = 0
     @status = 200
     @ttl = ttl
@@ -33,6 +35,7 @@ class FakePodIdentityAgent
 
   def stop
     @thread.kill
+    @workers.each(&:kill).each(&:join)
     @server.close
   end
 
@@ -41,7 +44,7 @@ class FakePodIdentityAgent
   def serve
     loop do
       socket = @server.accept
-      Thread.new(socket) { |s| handle(s) }
+      @workers << Thread.new(socket) { |s| handle(s) }
     end
   end
 
@@ -53,8 +56,9 @@ class FakePodIdentityAgent
       headers[name.downcase] = value.strip
     end
     @requests << Request.new(request_line.split[1], headers['authorization'])
+    hold&.pop
     sleep(delay) if delay.positive?
-    body = (status == 200) ? JSON.generate(payload) : '{"message":"unavailable"}'
+    body = raw_body || ((status == 200) ? JSON.generate(payload) : '{"message":"unavailable"}')
     socket.write("HTTP/1.1 #{status} X\r\nContent-Type: application/json\r\n" \
                  "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
   ensure
