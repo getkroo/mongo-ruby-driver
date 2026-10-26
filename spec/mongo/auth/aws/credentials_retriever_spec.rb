@@ -71,7 +71,7 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
 
       context 'when cached credentials expired' do
         before do
-          cache.credentials = double('credentials', expired?: true)
+          cache.credentials = double('credentials', expired?: true, usable?: false)
         end
 
         it_behaves_like 'obtains credentials from endpoints'
