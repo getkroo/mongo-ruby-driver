@@ -22,7 +22,8 @@ module Mongo
       # @api private
       class CredentialsNotFound < Mongo::Error::AuthError
         def initialize
-          super('Could not locate AWS credentials (checked Client URI and Ruby options, environment variables, ECS and EC2 metadata, and Web Identity)')
+          super('Could not locate AWS credentials (checked Client URI and Ruby options, environment variables, ' \
+                'Web Identity, ECS and container (EKS Pod Identity) credentials, and EC2 metadata)')
         end
       end
 
@@ -141,10 +142,24 @@ module Mongo
         #   the timeout defined on the operation context.
         def obtain_credentials_from_endpoints(timeout_holder = nil)
           if ((credentials = web_identity_credentials(timeout_holder)) && credentials_valid?(credentials, 'Web identity token')) ||
-             ((credentials = ecs_metadata_credentials(timeout_holder)) && credentials_valid?(credentials, 'ECS task metadata')) ||
-             ((credentials = ec2_metadata_credentials(timeout_holder)) && credentials_valid?(credentials, 'EC2 instance metadata'))
-            credentials
+             ((credentials = ecs_metadata_credentials(timeout_holder)) && credentials_valid?(credentials, 'ECS task metadata'))
+            return credentials
           end
+
+          if container_full_uri_configured?
+            # Never fall back to the node's instance role once a Pod Identity endpoint is configured.
+            credentials = container_full_uri_credentials(timeout_holder)
+            source = 'Container credentials (EKS Pod Identity)'
+          else
+            credentials = ec2_metadata_credentials(timeout_holder)
+            source = 'EC2 instance metadata'
+          end
+          credentials if credentials && credentials_valid?(credentials, source)
+        end
+
+        def container_full_uri_configured?
+          full_uri = ENV['AWS_CONTAINER_CREDENTIALS_FULL_URI']
+          !full_uri.nil? && !full_uri.empty?
         end
 
         # Returns credentials from the EC2 metadata endpoint. The credentials
@@ -222,15 +237,103 @@ module Mongo
           end
           return nil if resp.code != '200'
 
-          payload = JSON.parse(resp.body)
-          Credentials.new(
-            payload['AccessKeyId'],
-            payload['SecretAccessKey'],
-            payload['Token'],
-            DateTime.parse(payload['Expiration']).to_time
-          )
+          credentials_from_container_payload(resp.body)
         rescue ::Timeout::Error, IOError, SystemCallError, TypeError
           nil
+        end
+
+        # Returns credentials from the container credentials endpoint named by
+        # AWS_CONTAINER_CREDENTIALS_FULL_URI, which is how EKS Pod Identity
+        # hands credentials to a workload.
+        #
+        # @param [ CsotTimeoutHolder | nil ] timeout_holder CSOT timeout.
+        #
+        # @return [ Auth::Aws::Credentials | nil ] A set of credentials, or nil
+        #   if retrieval failed.
+        # @raise Auth::InvalidConfiguration if the URI targets a host the AWS
+        #   SDKs would refuse, or the authorization token is malformed.
+        # @raise Error::TimeoutError if credentials cannot be retrieved within
+        #   the timeout defined on the operation context.
+        def container_full_uri_credentials(timeout_holder = nil)
+          timeout_holder&.check_timeout!
+          full_uri = ENV['AWS_CONTAINER_CREDENTIALS_FULL_URI']
+          return nil if full_uri.nil? || full_uri.empty?
+
+          uri = ::URI.parse(full_uri)
+          unless container_credentials_uri_allowed?(uri)
+            raise Auth::InvalidConfiguration,
+                  'AWS_CONTAINER_CREDENTIALS_FULL_URI must use https, or http to a loopback ' \
+                  "address or a container credentials agent (got host #{uri.hostname.inspect})"
+          end
+
+          req = Net::HTTP::Get.new(uri)
+          token = container_authorization_token
+          req['Authorization'] = token if token
+          resp = with_timeout(timeout_holder) do
+            # nil proxy: an http_proxy in the environment must never see the token.
+            Net::HTTP.start(uri.hostname, uri.port, nil,
+                            use_ssl: uri.scheme == 'https',
+                            open_timeout: CONTAINER_AGENT_TIMEOUT,
+                            read_timeout: CONTAINER_AGENT_TIMEOUT) do |http|
+              http.request(req)
+            end
+          end
+          return nil if resp.code != '200'
+
+          credentials_from_container_payload(resp.body)
+        rescue ::Timeout::Error, IOError, SystemCallError, SocketError, OpenSSL::SSL::SSLError, TypeError,
+               ArgumentError, JSON::ParserError
+          nil
+        end
+
+        # ECS and EKS Pod Identity agent addresses; they serve plain HTTP.
+        CONTAINER_AGENT_HOSTS = %w[169.254.170.2 169.254.170.23 fd00:ec2::23].freeze
+
+        # Seconds, matching the AWS SDKs' container credentials client.
+        CONTAINER_AGENT_TIMEOUT = 5
+
+        # Mirrors the AWS SDKs so a hostile URI cannot send the token elsewhere.
+        def container_credentials_uri_allowed?(uri)
+          return true if uri.scheme == 'https'
+          return false unless uri.scheme == 'http'
+          return true if uri.hostname == 'localhost' || CONTAINER_AGENT_HOSTS.include?(uri.hostname)
+
+          IPAddr.new(uri.hostname).loopback?
+        rescue IPAddr::InvalidAddressError, IPAddr::AddressFamilyError
+          false
+        end
+
+        def container_authorization_token
+          token_file = ENV['AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE']
+          token = if token_file && !token_file.empty?
+                    # Read every call: the agent rotates the token file. Tokens are ~1 KB; cap the read.
+                    File.read(token_file, 16_384).to_s.strip
+                  else
+                    ENV['AWS_CONTAINER_AUTHORIZATION_TOKEN']
+                  end
+          return nil if token.nil? || token.empty?
+
+          if token.match?(/[\r\n]/)
+            raise Auth::InvalidConfiguration, 'AWS container authorization token contains a line break'
+          end
+
+          token
+        end
+
+        def credentials_from_container_payload(body)
+          payload = JSON.parse(body)
+          return nil unless payload.is_a?(Hash)
+
+          # Anything but a non-empty string would pass credentials_valid? and only fail at signing.
+          access_key_id, secret_access_key, session_token =
+            payload.values_at('AccessKeyId', 'SecretAccessKey', 'Token')
+                   .map { |value| value if value.is_a?(String) && !value.empty? }
+          Credentials.new(
+            access_key_id,
+            secret_access_key,
+            session_token,
+            DateTime.parse(payload['Expiration']).to_time
+          )
         end
 
         # Returns credentials associated with web identity token that is
