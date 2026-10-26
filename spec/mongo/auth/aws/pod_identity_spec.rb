@@ -40,12 +40,16 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
         .to eq(%w[token-v1 token-v2])
     end
 
-    it 'fails fast instead of falling back to the instance role when the agent is down' do
+    it 'does not fall back to the instance metadata endpoint when the agent is down' do
       agent.status = 500
-      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      hosts = []
+      allow(Net::HTTP).to receive(:new).and_wrap_original do |new, address, *args|
+        hosts << address
+        new.call(address, *args)
+      end
 
       expect { retriever.credentials }.to raise_error(Mongo::Auth::Aws::CredentialsNotFound)
-      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
+      expect(hosts).not_to include('169.254.169.254')
     end
 
     it 'treats a malformed agent payload as no credentials' do
@@ -62,11 +66,18 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
       end
     end
 
-    it 'rejects a payload with an empty field instead of caching credentials that cannot sign' do
-      agent.raw_body = %({"AccessKeyId":"ASIANEW","SecretAccessKey":"","Token":"new-token","Expiration":"#{(Time.now.utc + 3600).iso8601}"})
+    it 'rejects a payload with an empty or non-string field instead of caching credentials that cannot sign' do
+      expiration = (Time.now.utc + 3600).iso8601
+      [
+        %({"AccessKeyId":"ASIANEW","SecretAccessKey":"","Token":"new-token","Expiration":"#{expiration}"}),
+        %({"AccessKeyId":12345,"SecretAccessKey":"new","Token":"new-token","Expiration":"#{expiration}"}),
+      ].each do |body|
+        agent.raw_body = body
+        cache.clear
 
-      expect { retriever.credentials }.to raise_error(Mongo::Auth::InvalidConfiguration, /secret access key/)
-      expect(cache.credentials).to be_nil
+        expect { retriever.credentials }.to raise_error(Mongo::Auth::InvalidConfiguration, /without/), body
+        expect(cache.credentials).to be_nil
+      end
     end
 
     it 'refuses plain-http hosts other than loopback and the container agents' do

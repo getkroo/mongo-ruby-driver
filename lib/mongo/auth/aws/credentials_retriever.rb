@@ -324,9 +324,10 @@ module Mongo
           payload = JSON.parse(body)
           return nil unless payload.is_a?(Hash)
 
-          # An empty string would pass credentials_valid? and only fail at signing.
+          # Anything but a non-empty string would pass credentials_valid? and only fail at signing.
           access_key_id, secret_access_key, session_token =
-            payload.values_at('AccessKeyId', 'SecretAccessKey', 'Token').map { |value| value unless value.to_s.empty? }
+            payload.values_at('AccessKeyId', 'SecretAccessKey', 'Token')
+                   .map { |value| value if value.is_a?(String) && !value.empty? }
           Credentials.new(
             access_key_id,
             secret_access_key,
