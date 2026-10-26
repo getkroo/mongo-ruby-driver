@@ -24,11 +24,14 @@ describe Mongo::Auth::Aws do
       expect(cache.credentials).to eq(credentials)
     end
 
-    it 'drops the cached credentials when the server rejects them' do
-      allow(auth).to receive(:converse_2_step).and_raise(Mongo::Auth::Unauthorized.new(user))
+    it 'drops the cached credentials when the server rejects them or they cannot sign a request' do
+      [ Mongo::Auth::Unauthorized.new(user), Mongo::Error::InvalidServerAuthResponse.new('empty secret') ].each do |error|
+        cache.credentials = credentials
+        allow(auth).to receive(:converse_2_step).and_raise(error)
 
-      expect { auth.login }.to raise_error(Mongo::Auth::Unauthorized)
-      expect(cache.credentials).to be_nil
+        expect { auth.login }.to raise_error(error.class)
+        expect(cache.credentials).to be_nil
+      end
     end
   end
 end

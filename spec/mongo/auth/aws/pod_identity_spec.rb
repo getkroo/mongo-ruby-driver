@@ -70,6 +70,22 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
       expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1.5
     end
 
+    it 'treats a malformed agent payload as no credentials' do
+      bodies = [
+        'null',
+        '[]',
+        '{"AccessKeyId":"ASIANEW"}',
+        '{"AccessKeyId":"ASIANEW","SecretAccessKey":"new","Token":"new-token","Expiration":"not a time"}',
+      ]
+      bodies.each do |body|
+        agent.raw_body = body
+        fresh = described_class.new(nil, credentials_cache: Mongo::Auth::Aws::CredentialsCache.new)
+
+        expect { fresh.credentials }.to raise_error(Mongo::Auth::Aws::CredentialsNotFound), body
+      end
+      expect(agent.request_count).to eq(bodies.size)
+    end
+
     it 'rejects a payload with an empty or non-string field instead of caching credentials that cannot sign' do
       expiration = (Time.now.utc + 3600).iso8601
       [

@@ -24,8 +24,8 @@ module Mongo
       # @return [ BSON::Document ] The document of the authentication response.
       def login
         converse_2_step(connection, conversation)
-      rescue Auth::Unauthorized
-        # Only a server rejection means the cached credentials are bad; a socket error mid-handshake does not.
+      rescue Auth::Unauthorized, Error::InvalidServerAuthResponse
+        # Only a rejection or unsignable credentials mean the cached set is bad; a socket error mid-handshake does not.
         CredentialsCache.instance.clear
         raise
       end
