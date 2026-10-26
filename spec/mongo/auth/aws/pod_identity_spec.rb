@@ -62,6 +62,13 @@ describe Mongo::Auth::Aws::CredentialsRetriever do
       end
     end
 
+    it 'rejects a payload with an empty field instead of caching credentials that cannot sign' do
+      agent.raw_body = %({"AccessKeyId":"ASIANEW","SecretAccessKey":"","Token":"new-token","Expiration":"#{(Time.now.utc + 3600).iso8601}"})
+
+      expect { retriever.credentials }.to raise_error(Mongo::Auth::InvalidConfiguration, /secret access key/)
+      expect(cache.credentials).to be_nil
+    end
+
     it 'refuses plain-http hosts other than loopback and the container agents' do
       ENV['AWS_CONTAINER_CREDENTIALS_FULL_URI'] = 'http://attacker.example.com/creds'
       expect { retriever.credentials }.to raise_error(Mongo::Auth::InvalidConfiguration, /must use https/)

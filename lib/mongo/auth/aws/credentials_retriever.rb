@@ -22,7 +22,8 @@ module Mongo
       # @api private
       class CredentialsNotFound < Mongo::Error::AuthError
         def initialize
-          super('Could not locate AWS credentials (checked Client URI and Ruby options, environment variables, ECS and EC2 metadata, and Web Identity)')
+          super('Could not locate AWS credentials (checked Client URI and Ruby options, environment variables, ' \
+                'Web Identity, ECS and container (EKS Pod Identity) credentials, and EC2 metadata)')
         end
       end
 
@@ -323,10 +324,13 @@ module Mongo
           payload = JSON.parse(body)
           return nil unless payload.is_a?(Hash)
 
+          # An empty string would pass credentials_valid? and only fail at signing.
+          access_key_id, secret_access_key, session_token =
+            payload.values_at('AccessKeyId', 'SecretAccessKey', 'Token').map { |value| value unless value.to_s.empty? }
           Credentials.new(
-            payload['AccessKeyId'],
-            payload['SecretAccessKey'],
-            payload['Token'],
+            access_key_id,
+            secret_access_key,
+            session_token,
             DateTime.parse(payload['Expiration']).to_time
           )
         end
