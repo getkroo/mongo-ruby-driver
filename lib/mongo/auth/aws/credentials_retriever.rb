@@ -238,7 +238,7 @@ module Mongo
           return nil if resp.code != '200'
 
           credentials_from_container_payload(resp.body)
-        rescue ::Timeout::Error, IOError, SystemCallError, TypeError
+        rescue ::Timeout::Error, IOError, SystemCallError, TypeError, ArgumentError, JSON::ParserError
           nil
         end
 
@@ -411,7 +411,7 @@ module Mongo
           return nil if resp.code != '200'
 
           resp
-        rescue Errno::ENOENT, IOError, SystemCallError
+        rescue ::Timeout::Error, IOError, SystemCallError, SocketError, OpenSSL::SSL::SSLError
           nil
         end
 
