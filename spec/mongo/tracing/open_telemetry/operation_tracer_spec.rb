@@ -9,13 +9,11 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
   let(:parent_tracer) do
     instance_double(
       Mongo::Tracing::OpenTelemetry::Tracer,
-      cursor_context_map: cursor_context_map,
       parent_context_for: parent_context,
       transaction_context_map: transaction_context_map,
       transaction_map_key: transaction_key
     )
   end
-  let(:cursor_context_map) { {} }
   let(:transaction_context_map) { {} }
   let(:parent_context) { nil }
   let(:transaction_key) { nil }
@@ -41,6 +39,8 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
         allow(s).to receive(:set_attribute)
         allow(s).to receive(:record_exception)
         allow(s).to receive(:status=)
+        allow(s).to receive(:context).and_return(double('SpanContext', valid?: true))
+        allow(s).to receive(:recording?).and_return(true)
       end
     end
     let(:context) { double('OpenTelemetry::Context') }
@@ -91,6 +91,39 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
       operation_tracer.trace_operation(operation, operation_context) { result }
     end
 
+    # With no SDK installed and no valid parent, the API returns a span whose
+    # context is invalid. Nothing can be done with it, so it gets no work.
+    context 'with an invalid span' do
+      let(:invalid_span) { OpenTelemetry::Trace::Span::INVALID }
+
+      before do
+        allow(otel_tracer).to receive(:start_span).and_return(invalid_span)
+      end
+
+      it 'does not make the span current' do
+        expect(OpenTelemetry::Trace).not_to receive(:with_span)
+        operation_tracer.trace_operation(operation, operation_context) { result }
+      end
+
+      it 'returns the block result' do
+        return_value = operation_tracer.trace_operation(operation, operation_context) { :done }
+        expect(return_value).to eq(:done)
+      end
+
+      it 'does not finish the span' do
+        expect(invalid_span).not_to receive(:finish)
+        operation_tracer.trace_operation(operation, operation_context) { result }
+      end
+
+      it 'does not record a raised exception' do
+        error = StandardError.new('test error')
+        expect(invalid_span).not_to receive(:record_exception)
+        expect do
+          operation_tracer.trace_operation(operation, operation_context) { raise error }
+        end.to raise_error(error)
+      end
+    end
+
     context 'with custom operation name' do
       it 'uses the provided op_name' do
         expect(otel_tracer).to receive(:start_span).with(
@@ -132,11 +165,6 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
         allow(cursor).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
       end
 
-      it 'stores cursor context in map' do
-        operation_tracer.trace_operation(operation, operation_context) { cursor }
-        expect(cursor_context_map[12_345]).to eq(context)
-      end
-
       it 'sets the cursor_id attribute on span' do
         expect(span).to receive(:set_attribute).with('db.mongodb.cursor_id', 12_345)
         operation_tracer.trace_operation(operation, operation_context) { cursor }
@@ -166,19 +194,73 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
 
       before do
         allow(cursor).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
-        # rubocop:disable RSpec/VerifiedDoubles
-        cursor_context_map[cursor_id] = double('OpenTelemetry::Context')
-        # rubocop:enable RSpec/VerifiedDoubles
       end
 
-      it 'removes cursor from context map' do
+      it 'sets only the cursor id of the operation itself' do
+        expect(span).to receive(:set_attribute).with('db.mongodb.cursor_id', 999).once
         operation_tracer.trace_operation(operation, operation_context) { cursor }
-        expect(cursor_context_map).not_to have_key(cursor_id)
+      end
+    end
+
+    it 'passes no cursor id to start_span' do
+      expect(otel_tracer).to receive(:start_span).with(
+        anything,
+        attributes: hash_excluding('db.mongodb.cursor_id'),
+        with_parent: nil,
+        kind: :client
+      )
+      operation_tracer.trace_operation(operation, operation_context) { result }
+    end
+
+    # A span the sampler dropped is still made current, so that the command
+    # spans created within it nest under it, but gets nothing else.
+    context 'with a span that is not recording' do
+      let(:operation_class) { class_double(Mongo::Operation::GetMore, name: 'Mongo::Operation::GetMore') }
+      let(:operation) do
+        instance_double(
+          Mongo::Operation::GetMore,
+          db_name: 'test_db',
+          coll_name: 'test_collection',
+          cursor_id: 12_345,
+          class: operation_class,
+          respond_to?: true
+        )
       end
 
-      it 'does not set cursor_id attribute' do
-        expect(span).not_to receive(:set_attribute).with('db.mongodb.cursor_id', anything)
+      before do
+        allow(span).to receive(:recording?).and_return(false)
+      end
+
+      it 'does not set the cursor id' do
+        expect(span).not_to receive(:set_attribute)
+        operation_tracer.trace_operation(operation, operation_context) { result }
+      end
+
+      it 'still makes the span current' do
+        expect(OpenTelemetry::Trace).to receive(:with_span).with(span).and_yield(span, context)
+        operation_tracer.trace_operation(operation, operation_context) { result }
+      end
+
+      it 'does not record the cursor id of a new cursor' do
+        allow(operation).to receive(:cursor_id).and_return(nil)
+        cursor = instance_double(Mongo::Cursor, id: 777)
+        allow(cursor).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
+        expect(span).not_to receive(:set_attribute)
         operation_tracer.trace_operation(operation, operation_context) { cursor }
+      end
+
+      it 'does not record a raised exception' do
+        error = StandardError.new('test error')
+        expect(span).not_to receive(:record_exception)
+        expect(span).not_to receive(:status=)
+        expect do
+          operation_tracer.trace_operation(operation, operation_context) { raise error }
+        end.to raise_error(error)
+      end
+
+      it 'finishes the span' do
+        expect(span).to receive(:finish)
+        operation_tracer.trace_operation(operation, operation_context) { result }
       end
     end
 
@@ -253,10 +335,6 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
       expect(attributes['db.operation.summary']).to eq('find test_db.users')
     end
 
-    it 'does not include nil values' do
-      expect(attributes).not_to have_key('db.mongodb.cursor_id')
-    end
-
     context 'with cursor_id' do
       let(:operation_class) { class_double(Mongo::Operation::GetMore, name: 'Mongo::Operation::GetMore') }
       let(:operation) do
@@ -270,8 +348,8 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
         )
       end
 
-      it 'includes db.mongodb.cursor_id' do
-        expect(attributes['db.mongodb.cursor_id']).to eq(12_345)
+      it 'leaves the cursor id for after the span is known to record' do
+        expect(attributes).not_to have_key('db.mongodb.cursor_id')
       end
     end
 
@@ -295,6 +373,11 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
 
     it 'returns the operation class name in lowercase' do
       expect(op_name_result).to eq('find')
+    end
+
+    it 'derives the name once per operation class' do
+      expect(operation_class).to receive(:name).once.and_return('Mongo::Operation::Find')
+      3.times { operation_tracer.send(:operation_name, operation, nil) }
     end
 
     context 'with custom op_name' do
@@ -558,13 +641,12 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
     end
   end
 
-  describe '#process_cursor_context' do
-    subject(:process_result) do
-      operation_tracer.send(:process_cursor_context, result, cursor_id, context, span)
+  describe '#record_cursor_id' do
+    subject(:record_cursor) do
+      operation_tracer.send(:record_cursor_id, result, cursor_id, span, true)
     end
 
     # rubocop:disable RSpec/VerifiedDoubles
-    let(:context) { double('OpenTelemetry::Context') }
     let(:span) do
       double('OpenTelemetry::Trace::Span').tap do |s|
         allow(s).to receive(:set_attribute)
@@ -576,8 +658,9 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
       let(:result) { double('Result', is_a?: false) }
       # rubocop:enable RSpec/VerifiedDoubles
 
-      it 'does not modify cursor_context_map' do
-        expect { process_result }.not_to(change { cursor_context_map })
+      it 'does not set cursor_id attribute on span' do
+        expect(span).not_to receive(:set_attribute)
+        record_cursor
       end
     end
 
@@ -589,19 +672,11 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
 
       before do
         allow(result).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
-        # rubocop:disable RSpec/VerifiedDoubles
-        cursor_context_map[cursor_id] = double('OpenTelemetry::Context')
-        # rubocop:enable RSpec/VerifiedDoubles
-      end
-
-      it 'removes the cursor from context map' do
-        process_result
-        expect(cursor_context_map).not_to have_key(cursor_id)
       end
 
       it 'does not set cursor_id attribute on span' do
         expect(span).not_to receive(:set_attribute)
-        process_result
+        record_cursor
       end
     end
 
@@ -614,14 +689,20 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
         allow(result).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
       end
 
-      it 'stores the context in cursor_context_map' do
-        process_result
-        expect(cursor_context_map[456]).to eq(context)
-      end
-
       it 'sets the cursor_id attribute on span' do
         expect(span).to receive(:set_attribute).with('db.mongodb.cursor_id', 456)
-        process_result
+        record_cursor
+      end
+
+      context 'when the span is not recording' do
+        subject(:record_cursor) do
+          operation_tracer.send(:record_cursor_id, result, cursor_id, span, false)
+        end
+
+        it 'does not set cursor_id attribute on span' do
+          expect(span).not_to receive(:set_attribute)
+          record_cursor
+        end
       end
     end
 
@@ -633,18 +714,11 @@ describe Mongo::Tracing::OpenTelemetry::OperationTracer do
 
       before do
         allow(result).to receive(:is_a?).with(Mongo::Cursor).and_return(true)
-        # rubocop:disable RSpec/VerifiedDoubles
-        cursor_context_map[cursor_id] = double('OpenTelemetry::Context')
-        # rubocop:enable RSpec/VerifiedDoubles
-      end
-
-      it 'does not update cursor_context_map' do
-        expect { process_result }.not_to(change(cursor_context_map, :keys))
       end
 
       it 'does not set cursor_id attribute on span' do
         expect(span).not_to receive(:set_attribute)
-        process_result
+        record_cursor
       end
     end
   end

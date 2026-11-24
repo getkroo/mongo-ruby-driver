@@ -22,6 +22,18 @@ module Tracing
       @attributes[key] = value
     end
 
+    # Mirrors OpenTelemetry::Trace::Span#context. Spans from this tracer
+    # always have a valid context, so the driver traces them fully.
+    def context
+      @context ||= Context.new(self)
+    end
+
+    # Mirrors OpenTelemetry::Trace::Span#recording?. Spans from this tracer
+    # always record, so the assertions see every attribute.
+    def recording?
+      true
+    end
+
     # rubocop:disable Lint/UnusedMethodArgument
     def record_exception(exception, attributes: nil)
       set_attribute('exception.type', exception.class.to_s)
@@ -52,6 +64,10 @@ module Tracing
 
     def initialize(span)
       @span = span
+    end
+
+    def valid?
+      true
     end
   end
 

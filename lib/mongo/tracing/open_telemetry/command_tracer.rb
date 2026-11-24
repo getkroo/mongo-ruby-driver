@@ -23,12 +23,8 @@ module Mongo
       class CommandTracer
         include Mongo::Monitoring::Event::Secure
 
-        # Commands for which a span MUST NOT be created. The OpenTelemetry spec
-        # requires drivers to skip command spans for sensitive commands listed in
-        # the Command Logging and Monitoring spec. We additionally skip hello /
-        # legacy hello in all forms — these are handshake/heartbeat traffic and
-        # would only add noise to traces.
-        HELLO_COMMANDS = %w[hello ismaster isMaster].freeze
+        # Upper bound of the lsid string cache (see #lsid).
+        LSID_CACHE_MAX = 128
 
         # Initializes a new CommandTracer.
         #
@@ -41,6 +37,8 @@ module Mongo
           @otel_tracer = otel_tracer
           @parent_tracer = parent_tracer
           @query_text_max_length = query_text_max_length
+          @lsid_cache = {}
+          @lsid_cache_mutex = Mutex.new
         end
 
         # Starts a span for a MongoDB command.
@@ -64,55 +62,84 @@ module Mongo
         # @yield the block representing the command to be traced.
         #
         # @return [ Object ] the result of the command.
-        # rubocop:disable Lint/RescueException
-        def trace_command(message, _operation_context, connection)
-          return yield if skip_tracing?(message)
+        def trace_command(message, _operation_context, connection, &block)
+          # Read the command document and name once and pass them on: every
+          # read of message.documents allocates.
+          doc = message.documents.first
+          name = command_name(doc)
+          return yield if skip_tracing?(doc, name)
 
           # Commands should always be nested under their operation span, not directly under
           # the transaction span. Don't pass with_parent to use automatic parent resolution
           # from the currently active span (the operation span).
-          span = create_command_span(message, connection)
-          ::OpenTelemetry::Trace.with_span(span) do |s, c|
+          span = create_command_span(name, doc, connection)
+          # With no SDK and no valid parent, the API returns a span with an
+          # invalid context. It cannot be made current, recorded or
+          # propagated, so it gets no work at all, not even finishing it.
+          return yield unless span.context.valid?
+
+          trace_with_span(span, message, name, doc, &block)
+        end
+
+        private
+
+        # Runs the command with the span made current, and finishes the span.
+        # A span that is not recording is still made current, so that its
+        # context is propagated, but gets no further attributes and no
+        # outcome: the SDK would discard them.
+        #
+        # @param span [ OpenTelemetry::Trace::Span ] a span with a valid context.
+        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
+        #
+        # @return [ Object ] the result of the command.
+        #
+        # rubocop:disable Lint/RescueException
+        def trace_with_span(span, message, name, doc)
+          recording = span.recording?
+          apply_deferred_attributes(span, message, name, doc) if recording
+          ::OpenTelemetry::Trace.with_span(span) do |s, _c|
             yield.tap do |result|
-              process_command_result(result, cursor_id(message), c, s)
+              process_command_result(result, s) if recording
             end
           end
         rescue Exception => e
-          handle_command_exception(span, e)
+          handle_command_exception(span, e) if recording
           raise e
         ensure
-          span&.finish
+          span.finish
         end
         # rubocop:enable Lint/RescueException
-
-        private
 
         # Determines whether the command must not be traced. Sensitive auth
         # commands carry credentials in their payloads (SCRAM proofs, cleartext
         # passwords, etc.) and the OpenTelemetry spec requires drivers to skip
-        # command spans for them. Hello / legacy hello are also skipped to keep
-        # handshake traffic out of traces.
+        # command spans for them. Hello / legacy hello in all forms
+        # (Secure::HELLO_COMMANDS) are also skipped: they are handshake and
+        # heartbeat traffic and would only add noise to traces.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
+        # @param name [ String ] the command name.
         #
         # @return [ Boolean ] true when no command span should be created.
-        def skip_tracing?(message)
-          name = command_name(message)
+        def skip_tracing?(doc, name)
           return true if HELLO_COMMANDS.include?(name)
 
-          sensitive?(command_name: name, document: message.documents.first)
+          sensitive?(command_name: name, document: doc)
         end
 
         # Creates a span for a command.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
         # @param connection [ Mongo::Server::Connection ] the connection.
         #
         # @return [ OpenTelemetry::Trace::Span ] the created span.
-        def create_command_span(message, connection)
+        def create_command_span(name, doc, connection)
           @otel_tracer.start_span(
-            command_name(message),
-            attributes: span_attributes(message, connection),
+            name,
+            attributes: span_attributes(doc, name, connection),
             kind: :client
           )
         end
@@ -120,21 +147,17 @@ module Mongo
         # Processes the command result and updates span attributes.
         #
         # @param result [ Object ] the command result.
-        # @param cursor_id [ Integer | nil ] the cursor ID.
-        # @param context [ OpenTelemetry::Context ] the context.
         # @param span [ OpenTelemetry::Trace::Span ] the current span.
-        def process_command_result(result, cursor_id, context, span)
-          process_cursor_context(result, cursor_id, context, span)
+        def process_command_result(result, span)
+          process_cursor_context(result, span)
           maybe_trace_error(result, span)
         end
 
         # Handles exceptions that occur during command execution.
         #
-        # @param span [ OpenTelemetry::Trace::Span | nil ] the span.
+        # @param span [ OpenTelemetry::Trace::Span ] the span.
         # @param exception [ Exception ] the exception that occurred.
         def handle_command_exception(span, exception)
-          return unless span
-
           if exception.is_a?(Mongo::Error::OperationFailure)
             span.set_attribute('db.response.status_code', exception.code.to_s)
           end
@@ -142,70 +165,68 @@ module Mongo
           span.status = ::OpenTelemetry::Trace::Status.error("Unhandled exception of type: #{exception.class}")
         end
 
-        # Builds span attributes for the command.
+        # Builds the attributes passed at span creation: the cheap set the
+        # OpenTelemetry spec recommends. They are built for every span,
+        # recorded or not, and are the only ones the sampler sees. The rest
+        # are set by apply_deferred_attributes once the span is known to
+        # record.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
+        # @param name [ String ] the command name.
         # @param connection [ Mongo::Server::Connection ] the connection.
         #
         # @return [ Hash ] OpenTelemetry span attributes following MongoDB semantic conventions.
-        def span_attributes(message, connection)
-          base_attributes(message)
-            .merge(connection_attributes(connection))
-            .merge(session_attributes(message))
-            .compact
-        end
-
-        # Returns base database and command attributes.
-        #
-        # @param message [ Mongo::Protocol::Message ] the command message.
-        #
-        # @return [ Hash ] base span attributes.
-        def base_attributes(message)
+        def span_attributes(doc, name, connection)
           {
             'db.system.name' => 'mongodb',
-            'db.namespace' => database(message),
-            'db.collection.name' => collection_name(message),
-            'db.command.name' => command_name(message),
-            'db.query.summary' => query_summary(message),
-            'db.query.text' => query_text(message)
-          }
+            'db.namespace' => database(doc),
+            'db.collection.name' => collection_name(name, doc),
+            'db.command.name' => name
+          }.compact.merge(connection_attributes(connection))
         end
 
-        # Returns connection-related attributes.
+        # Sets the remaining attributes on a span that is recording. They are
+        # not visible to the sampler; only custom samplers keying on them are
+        # affected.
+        #
+        # @param span [ OpenTelemetry::Trace::Span ] the span.
+        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
+        def apply_deferred_attributes(span, message, name, doc)
+          {
+            'db.query.summary' => query_summary(name, doc),
+            'db.query.text' => query_text(message),
+            'db.mongodb.cursor_id' => cursor_id(name, doc),
+            'db.mongodb.lsid' => lsid(doc),
+            'db.mongodb.txn_number' => txn_number(doc)
+          }.each do |key, value|
+            span.set_attribute(key, value) unless value.nil?
+          end
+        end
+
+        # Returns connection-related attributes, built once per connection,
+        # frozen and kept on the connection. Two threads may build them at
+        # the same time; they build the same hash, so either result is fine.
         #
         # @param connection [ Mongo::Server::Connection ] the connection.
         #
         # @return [ Hash ] connection span attributes.
         def connection_attributes(connection)
-          {
+          connection.tracing_attributes ||= {
             'server.port' => connection.address.port,
             'server.address' => connection.address.host,
             'network.transport' => connection.transport.to_s,
-            'db.mongodb.server_connection_id' => connection.server.description.server_connection_id,
+            'db.mongodb.server_connection_id' => connection.description.server_connection_id,
             'db.mongodb.driver_connection_id' => connection.id
-          }
-        end
-
-        # Returns session and transaction attributes.
-        #
-        # @param message [ Mongo::Protocol::Message ] the command message.
-        #
-        # @return [ Hash ] session span attributes.
-        def session_attributes(message)
-          {
-            'db.mongodb.cursor_id' => cursor_id(message),
-            'db.mongodb.lsid' => lsid(message),
-            'db.mongodb.txn_number' => txn_number(message)
-          }
+          }.freeze
         end
 
         # Processes cursor context from the command result.
         #
         # @param result [ Object ] the command result.
-        # @param _cursor_id [ Integer | nil ] the cursor ID (unused).
-        # @param _context [ OpenTelemetry::Context ] the context (unused).
         # @param span [ OpenTelemetry::Trace::Span ] the current span.
-        def process_cursor_context(result, _cursor_id, _context, span)
+        def process_cursor_context(result, span)
           cursor_id = normalize_cursor_id(result.cursor_id)
           return unless cursor_id.positive?
 
@@ -242,51 +263,56 @@ module Mongo
 
         # Generates a summary string for the query.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ String ] summary in format "command_name db.collection" or "command_name db".
-        def query_summary(message)
-          if (coll_name = collection_name(message))
-            "#{command_name(message)} #{database(message)}.#{coll_name}"
+        def query_summary(name, doc)
+          if (coll_name = collection_name(name, doc))
+            "#{name} #{database(doc)}.#{coll_name}"
           else
-            "#{command_name(message)} #{database(message)}"
+            "#{name} #{database(doc)}"
           end
         end
 
-        # Extracts the collection name from the command message.
+        # Extracts the collection name from the command document.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ String | nil ] the collection name, or nil if not applicable.
-        def collection_name(message)
-          case command_name(message)
+        def collection_name(name, doc)
+          case name
           when 'getMore'
-            message.documents.first['collection'].to_s
+            doc['collection'].to_s
           when 'listCollections', 'listDatabases', 'commitTransaction', 'abortTransaction'
             nil
           else
-            value = message.documents.first.values.first
+            # The first value, read without building an array of all of them.
+            value = doc.each_value { |v| break v } # rubocop:disable Lint/UnreachableLoop -- first value only
             # Return nil if the value is not a string (e.g., for admin commands that have numeric values)
             value.is_a?(String) ? value : nil
           end
         end
 
-        # Extracts the command name from the message.
+        # Extracts the command name, the first key of the command document,
+        # without building an array of all keys.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ String ] the command name.
-        def command_name(message)
-          message.documents.first.keys.first.to_s
+        def command_name(doc)
+          doc.each_key { |key| return key.to_s } # rubocop:disable Lint/UnreachableLoop -- first key only
+          ''
         end
 
-        # Extracts the database name from the message.
+        # Extracts the database name from the command document.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ String ] the database name.
-        def database(message)
-          message.documents.first['$db'].to_s
+        def database(doc)
+          doc['$db'].to_s
         end
 
         # Checks if query text capture is enabled.
@@ -298,34 +324,47 @@ module Mongo
 
         # Extracts the cursor ID from getMore commands.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param name [ String ] the command name.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ Integer | nil ] the cursor ID, or nil if not a getMore command.
-        def cursor_id(message)
-          return unless command_name(message) == 'getMore'
+        def cursor_id(name, doc)
+          return unless name == 'getMore'
 
-          message.documents.first['getMore'].value
+          doc['getMore'].value
         end
 
-        # Extracts the logical session ID from the command.
+        # Extracts the logical session ID from the command, as a UUID string.
+        # The string is formatted once per session id and kept in a small
+        # cache, cleared when it reaches LSID_CACHE_MAX entries.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
         #
-        # @return [ BSON::Binary | nil ] the session ID, or nil if not present.
-        def lsid(message)
-          lsid_doc = message.documents.first['lsid']
+        # @return [ String | nil ] the session ID, or nil if not present.
+        def lsid(doc)
+          lsid_doc = doc['lsid']
           return unless lsid_doc
 
-          lsid_doc['id'].to_uuid
+          binary = lsid_doc['id']
+          key = binary.data
+          cached = @lsid_cache_mutex.synchronize { @lsid_cache[key] }
+          return cached if cached
+
+          uuid = binary.to_uuid
+          @lsid_cache_mutex.synchronize do
+            @lsid_cache.clear if @lsid_cache.size >= LSID_CACHE_MAX
+            @lsid_cache[key] = uuid
+          end
+          uuid
         end
 
         # Extracts the transaction number from the command.
         #
-        # @param message [ Mongo::Protocol::Message ] the command message.
+        # @param doc [ Hash ] the command document.
         #
         # @return [ Integer | nil ] the transaction number, or nil if not present.
-        def txn_number(message)
-          txn_num = message.documents.first['txnNumber']
+        def txn_number(doc)
+          txn_num = doc['txnNumber']
           return unless txn_num
 
           txn_num.value
